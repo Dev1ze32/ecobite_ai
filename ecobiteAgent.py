@@ -12,8 +12,6 @@ from langgraph.graph import StateGraph, END, START
 from langgraph.prebuilt import ToolNode
 from langgraph.checkpoint.memory import MemorySaver
 
-# If you have the prompt in a separate file, keep this import. 
-# Otherwise, you can paste the get_main_reply_prompt function here.
 from prompts.main_reply_prompt import get_main_reply_prompt
 
 load_dotenv()
@@ -30,17 +28,24 @@ class AgentState(TypedDict):
     config: AgentConfig
 
 # --- TOOLS ---
-def create_tools(config: AgentConfig): # Fixed typo 'cofig' -> 'config'
-    @tool
-    def current_dateTime():
+def create_tools(config: AgentConfig): 
+    @tool(description=
         """
         Use this tool ONLY when the user explicitly asks for the 'current date', 'current time', 
         'today's date', or 'what day is it'.
-        """
+        """)
+    def current_dateTime():
         now = datetime.now()
         return now.strftime("%b %d, %Y %H:%M") # Simplified return
     
     return [current_dateTime]
+
+    @tool(descriptio=
+    """
+    Fetch the user inventory from supabase
+    """)
+    def _fetch_inventory():
+        return
 
 # --- GRAPH BUILDER ---
 # CRITICAL CHANGE: Added 'checkpointer' argument here
