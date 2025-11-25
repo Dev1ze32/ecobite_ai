@@ -13,10 +13,12 @@ from langgraph.prebuilt import ToolNode
 from langgraph.checkpoint.memory import MemorySaver
 from langchain_chroma import Chroma
 
+
 from prompts.main_reply_prompt import get_main_reply_prompt
+from helper.supabase import get_user_inventory
 
 load_dotenv()
-db_dir = "./chroma_db" # Fixed typo from 'chromba_db' to 'chroma_db' for consistency
+db_dir = "./chroma_db"
 collection_name = "ecobite_faq"
 
 # --- CONFIGS ---
@@ -33,19 +35,25 @@ class AgentState(TypedDict):
 embeddings = OpenAIEmbeddings(
     model="text-embedding-3-small"
 )
+
+# Initialize Vector Store if available
+vectorStore = None
+retriever = None
+
 if os.path.exists(db_dir) and os.listdir(db_dir):
     print(f"--- Existing database found in {db_dir}. Loading... ---")
-    
-    # Just load the existing DB, do not create new embeddings
-    vectorStore = Chroma(
-        persist_directory=db_dir,
-        embedding_function=embeddings,
-        collection_name=collection_name
-    )
-retriever = vectorStore.as_retriever(
-    search_type="similarity",
-    search_kwargs={"k": 5}
-)
+    try:
+        vectorStore = Chroma(
+            persist_directory=db_dir,
+            embedding_function=embeddings,
+            collection_name=collection_name
+        )
+        retriever = vectorStore.as_retriever(
+            search_type="similarity",
+            search_kwargs={"k": 5}
+        )
+    except Exception as e:
+        print(f"⚠️ Warning: Could not load Chroma DB: {e}")
 
 # --- TOOLS ---
 def create_tools(config: AgentConfig): 
@@ -56,15 +64,17 @@ def create_tools(config: AgentConfig):
         """)
     def current_dateTime():
         now = datetime.now()
-        return now.strftime("%b %d, %Y %H:%M") # Simplified return
-    
+        return now.strftime("%b %d, %Y %H:%M")
 
-    @tool
-    def ecobite_faq_retriever(query: str) -> str:
+    @tool(description=        
         """
         This tool searches and returns the information from the EcoBite FAQ document 
         to answer questions related to the app, features, donations, and usage.
-        """
+        """)
+    def ecobite_faq_retriever(query: str) -> str:
+        if not retriever:
+            return "FAQ database is currently unavailable."
+            
         docs = retriever.invoke(query)
 
         if not docs:
@@ -75,11 +85,40 @@ def create_tools(config: AgentConfig):
             results.append(f"Source Document Chunk {i+1} (Page {doc.metadata.get('page', 'N/A')}):\n{doc.page_content}")
         
         return "\n\n".join(results)
+    
+    @tool(description=
+        """
+        Retrieves the user's current inventory, including item names, quantities, and expiration dates.
+        Use this tool when the user asks about:
+        - what items they currently have
+        - what is expiring or near expiration
+        - checking their stock or available ingredients
+        - recipes or meal ideas based on inventory
 
-    return [current_dateTime, ecobite_faq_retriever]
+        Requires: user_id
+        """)
+    def user_inventory_retriever(user_id: int) -> str:
+        # Call the Supabase function
+        items = get_user_inventory(user_id)
+        
+        if not items:
+            return "The user's inventory is empty."
+        
+        # Format the output so the LLM can read it easily
+        # Based on your table schema: item_name, quantity, unit, expiry_date
+        formatted_list = ["Current Inventory:"]
+        for item in items:
+            name = item.get("item_name", "Unknown")
+            qty = item.get("quantity", 0)
+            unit = item.get("unit", "")
+            expiry = item.get("expiry_date", "N/A")
+            formatted_list.append(f"- {name}: {qty} {unit} (Expires: {expiry})")
+            
+        return "\n".join(formatted_list)
+
+    return [current_dateTime, ecobite_faq_retriever, user_inventory_retriever]
 
 # --- GRAPH BUILDER ---
-# CRITICAL CHANGE: Added 'checkpointer' argument here
 def build_agent_graph(config: AgentConfig = None, checkpointer = None):
     if config is None:
         config = AgentConfig()
@@ -96,8 +135,14 @@ def build_agent_graph(config: AgentConfig = None, checkpointer = None):
         messages = state["messages"]
         
         # Ensure System Prompt is always present
-        system_prompt = SystemMessage(content=get_main_reply_prompt(tools[1].name))
-        all_messages = [system_prompt] + messages
+        # Note: You might need to update your main_reply_prompt to mention the new inventory capability
+        system_prompt_content = get_main_reply_prompt(tools[1].name, tools[2].name)
+        system_prompt = SystemMessage(content=system_prompt_content)
+        
+        # Filter out previous system messages to avoid stacking them
+        filtered_messages = [msg for msg in messages if not isinstance(msg, SystemMessage)]
+        
+        all_messages = [system_prompt] + filtered_messages
         
         response = model.invoke(all_messages)
         return {"messages": [response]}
@@ -130,7 +175,6 @@ def build_agent_graph(config: AgentConfig = None, checkpointer = None):
     graph.add_edge("tools", "agent")
 
     # 5. Persistence Strategy
-    # CRITICAL CHANGE: Logic to handle external DB or fallback to RAM
     if checkpointer is None:
         checkpointer = MemorySaver()
     

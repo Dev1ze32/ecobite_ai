@@ -1,9 +1,14 @@
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, HTTPException, Security, Depends, status
+from fastapi import FastAPI, HTTPException, Security, Depends, status, Request
 from fastapi.security import APIKeyHeader
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from langchain_core.messages import HumanMessage, AIMessage
 from ecobiteAgent import build_agent_graph
+
+# Rate Limiting Imports (The "Speed Bump")
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
 
 # Postgres / Supabase Imports
 from langgraph.checkpoint.postgres import PostgresSaver
@@ -15,18 +20,17 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+# --- RATE LIMITER SETUP ---
+# Identifies users by their IP address
+limiter = Limiter(key_func=get_remote_address)
+
 # --- SECURITY SETUP ---
-# This defines the name of the header we expect (e.g., in Postman or React Native)
 API_KEY_NAME = "X-API-Key"
 api_key_header = APIKeyHeader(name=API_KEY_NAME, auto_error=True)
-
-# Get the real secret key from the server environment
 SERVER_API_KEY = os.getenv("ECOBITE_API_KEY")
 
-# Dependency function that runs before every request
 async def get_api_key(api_key_header: str = Security(api_key_header)):
     if not SERVER_API_KEY:
-        # Fail open or closed? Safer to fail closed if config is missing.
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Server API Key configuration is missing"
@@ -84,7 +88,6 @@ async def lifespan(app: FastAPI):
         agent_app = build_agent_graph()
         yield
 
-# We add 'dependencies=[Depends(get_api_key)]' to secure ALL endpoints globally
 app = FastAPI(
     title="EcoBite Agent API", 
     version="1.5", 
@@ -92,20 +95,43 @@ app = FastAPI(
     dependencies=[Depends(get_api_key)] 
 )
 
+# Initialize Rate Limiter on App
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+# --- STRICT INPUT VALIDATION ("The Weight Limit") ---
 class ChatRequest(BaseModel):
-    message: str
-    thread_id: str
+    # Limit message to 2000 chars (approx 300-400 tokens)
+    message: str = Field(..., max_length=2000, min_length=1)
+    
+    # Limit thread_id to prevent database key abuse
+    thread_id: str = Field(..., max_length=100)
+    
+    # Added user_id so we can fetch specific inventory
+    user_id: int
 
 class ChatResponse(BaseModel):
     response: str
     thread_id: str
 
 @app.post("/chat", response_model=ChatResponse)
-def chat_endpoint(request: ChatRequest):
+@limiter.limit("5/minute") # Strict: Only 5 chats per minute per IP
+def chat_endpoint(request: Request, chat_req: ChatRequest):
     global agent_app
     try:
-        config = {"configurable": {"thread_id": request.thread_id}}
-        user_message = HumanMessage(content=request.message)
+        # We pass user_id in the config metadata as well, which is good practice
+        config = {
+            "configurable": {
+                "thread_id": chat_req.thread_id,
+                "user_id": chat_req.user_id 
+            }
+        }
+        
+        # We also inject the user_id into the message content.
+        # This ensures the LLM explicitly "sees" the ID in the context window
+        # so it knows what argument to pass to 'user_inventory_retriever(user_id=...)'
+        context_aware_message = f"User ID: {chat_req.user_id}\n\n{chat_req.message}"
+        user_message = HumanMessage(content=context_aware_message)
         
         output = agent_app.invoke(
             {"messages": [user_message]},
@@ -116,16 +142,22 @@ def chat_endpoint(request: ChatRequest):
         
         return ChatResponse(
             response=last_message.content,
-            thread_id=request.thread_id
+            thread_id=chat_req.thread_id
         )
     except Exception as e:
         print(f"🔥 Chat Error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        # Be careful not to expose internal stack traces to users
+        raise HTTPException(status_code=500, detail="Internal processing error")
 
 @app.get("/history/{thread_id}")
-def get_history(thread_id: str):
+@limiter.limit("20/minute") # Less strict for history, but still protected
+def get_history(thread_id: str, request: Request):
     global agent_app
     try:
+        # Validate thread_id length manually here since it's a path param
+        if len(thread_id) > 100:
+             raise HTTPException(status_code=422, detail="Thread ID too long")
+
         config = {"configurable": {"thread_id": thread_id}}
         state = agent_app.get_state(config)
         
@@ -142,11 +174,19 @@ def get_history(thread_id: str):
                 msg_type = "user"
             else:
                 continue 
-                
+            
+            # Clean up the message content for history display if needed
+            # (Optional: strip the "User ID: ..." prefix if you don't want to show it in UI)
+            content = msg.content
+            if msg_type == "user" and content.startswith("User ID:"):
+                # Simple split to hide the system injection from the frontend history if desired
+                # But kept as-is for now for transparency/debugging
+                pass
+
             formatted_messages.append({
                 "id": str(getattr(msg, "id", "")),
                 "type": msg_type,
-                "message": msg.content,
+                "message": content,
                 "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
             })
 
@@ -157,5 +197,5 @@ def get_history(thread_id: str):
         return {"messages": []}
 
 if __name__ == "__main__":
-    print("🚀 Starting server on port 8001...")
+    print("🚀 Starting Secure Server on port 8001...")
     uvicorn.run(app, host="0.0.0.0", port=8001)
