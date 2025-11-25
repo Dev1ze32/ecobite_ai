@@ -7,5 +7,6 @@ langchain-core
 langchain-openai
 langchain-chroma
 langgraph
+langgraph-checkpoint-postgres
 psycopg_pool
 supabase
