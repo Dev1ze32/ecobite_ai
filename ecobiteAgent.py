@@ -5,16 +5,19 @@ import os
 
 from dotenv import load_dotenv
 from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
-from langchain_openai import ChatOpenAI
+from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain_core.tools import tool
 from langgraph.graph.message import add_messages
 from langgraph.graph import StateGraph, END, START
 from langgraph.prebuilt import ToolNode
 from langgraph.checkpoint.memory import MemorySaver
+from langchain_chroma import Chroma
 
 from prompts.main_reply_prompt import get_main_reply_prompt
 
 load_dotenv()
+db_dir = "./chroma_db" # Fixed typo from 'chromba_db' to 'chroma_db' for consistency
+collection_name = "ecobite_faq"
 
 # --- CONFIGS ---
 @dataclass
@@ -27,6 +30,23 @@ class AgentState(TypedDict):
     messages: Annotated[Sequence[BaseMessage], add_messages]
     config: AgentConfig
 
+embeddings = OpenAIEmbeddings(
+    model="text-embedding-3-small"
+)
+if os.path.exists(db_dir) and os.listdir(db_dir):
+    print(f"--- Existing database found in {db_dir}. Loading... ---")
+    
+    # Just load the existing DB, do not create new embeddings
+    vectorStore = Chroma(
+        persist_directory=db_dir,
+        embedding_function=embeddings,
+        collection_name=collection_name
+    )
+retriever = vectorStore.as_retriever(
+    search_type="similarity",
+    search_kwargs={"k": 5}
+)
+
 # --- TOOLS ---
 def create_tools(config: AgentConfig): 
     @tool(description=
@@ -38,14 +58,25 @@ def create_tools(config: AgentConfig):
         now = datetime.now()
         return now.strftime("%b %d, %Y %H:%M") # Simplified return
     
-    return [current_dateTime]
 
-    @tool(descriptio=
-    """
-    Fetch the user inventory from supabase
-    """)
-    def _fetch_inventory():
-        return
+    @tool
+    def ecobite_faq_retriever(query: str) -> str:
+        """
+        This tool searches and returns the information from the EcoBite FAQ document 
+        to answer questions related to the app, features, donations, and usage.
+        """
+        docs = retriever.invoke(query)
+
+        if not docs:
+            return f"Didn't find relevant information about {query} in the EcoBite FAQ document."
+        
+        results = []
+        for i, doc in enumerate(docs):
+            results.append(f"Source Document Chunk {i+1} (Page {doc.metadata.get('page', 'N/A')}):\n{doc.page_content}")
+        
+        return "\n\n".join(results)
+
+    return [current_dateTime, ecobite_faq_retriever]
 
 # --- GRAPH BUILDER ---
 # CRITICAL CHANGE: Added 'checkpointer' argument here
@@ -65,7 +96,7 @@ def build_agent_graph(config: AgentConfig = None, checkpointer = None):
         messages = state["messages"]
         
         # Ensure System Prompt is always present
-        system_prompt = SystemMessage(content=get_main_reply_prompt())
+        system_prompt = SystemMessage(content=get_main_reply_prompt(tools[1].name))
         all_messages = [system_prompt] + messages
         
         response = model.invoke(all_messages)
