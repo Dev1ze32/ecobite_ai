@@ -186,9 +186,14 @@ def get_history(thread_id: str, request: Request):
                 continue 
             
             content = msg.content
-            # Optional: Hide system injections from history
+            # Clean up System Injections
             if msg_type == "user" and content.startswith("User ID:"):
-                pass
+                # The content format is "User ID: 123\n\nActual Message"
+                # We split by the first double newline to get the real message
+                parts = content.split("\n\n", 1)
+                if len(parts) > 1:
+                    content = parts[1]
+                # If split fails, we keep original content (fallback)
 
             formatted_messages.append({
                 "id": str(getattr(msg, "id", "")),
