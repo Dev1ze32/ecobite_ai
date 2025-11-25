@@ -1,13 +1,13 @@
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, Security, Depends, status, Request
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import APIKeyHeader
 from pydantic import BaseModel, Field
 from langchain_core.messages import HumanMessage, AIMessage
 from ecobiteAgent import build_agent_graph
 
-# Rate Limiting Imports (The "Speed Bump")
+# Rate Limiting Imports
 from slowapi import Limiter, _rate_limit_exceeded_handler
-from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
 
 # Postgres / Supabase Imports
@@ -20,9 +20,16 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# --- RATE LIMITER SETUP ---
-# Identifies users by their IP address
-limiter = Limiter(key_func=get_remote_address)
+# --- RATE LIMITER SETUP (FIXED FOR RAILWAY/CLOUD) ---
+def get_real_ip(request: Request):
+    forwarded = request.headers.get("X-Forwarded-For")
+    if forwarded:
+        # The first IP in the list is the real client
+        return forwarded.split(",")[0]
+    # Fallback to direct connection (useful for local testing)
+    return request.client.host or "127.0.0.1"
+
+limiter = Limiter(key_func=get_real_ip)
 
 # --- SECURITY SETUP ---
 API_KEY_NAME = "X-API-Key"
@@ -51,6 +58,7 @@ async def lifespan(app: FastAPI):
     global agent_app
     if DB_URI:
         try:
+            # SSL Mode is required for Supabase/Cloud Postgres
             conn_kwargs = {
                 "sslmode": "require",
                 "autocommit": True,
@@ -95,19 +103,26 @@ app = FastAPI(
     dependencies=[Depends(get_api_key)] 
 )
 
-# Initialize Rate Limiter on App
+# --- CORS MIDDLEWARE (Crucial for Web/Mobile access) ---
+# Allows your specific frontend apps to talk to this server
+app.add_middleware(
+    CORSMiddleware,
+    # Mobile apps often don't send an Origin header, so they bypass this check (which is fine).
+    # Browsers DO send it, so this whitelist secures your web dashboard.
+    allow_origins=["https://ecobite-website-m55hr2wbn-dell-ancisos-projects.vercel.app"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Initialize Rate Limiter
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
-# --- STRICT INPUT VALIDATION ("The Weight Limit") ---
+# --- STRICT INPUT VALIDATION ---
 class ChatRequest(BaseModel):
-    # Limit message to 2000 chars (approx 300-400 tokens)
     message: str = Field(..., max_length=2000, min_length=1)
-    
-    # Limit thread_id to prevent database key abuse
     thread_id: str = Field(..., max_length=100)
-    
-    # Added user_id so we can fetch specific inventory
     user_id: int
 
 class ChatResponse(BaseModel):
@@ -115,11 +130,10 @@ class ChatResponse(BaseModel):
     thread_id: str
 
 @app.post("/chat", response_model=ChatResponse)
-@limiter.limit("5/minute") # Strict: Only 5 chats per minute per IP
+@limiter.limit("5/minute")
 def chat_endpoint(request: Request, chat_req: ChatRequest):
     global agent_app
     try:
-        # We pass user_id in the config metadata as well, which is good practice
         config = {
             "configurable": {
                 "thread_id": chat_req.thread_id,
@@ -127,9 +141,7 @@ def chat_endpoint(request: Request, chat_req: ChatRequest):
             }
         }
         
-        # We also inject the user_id into the message content.
-        # This ensures the LLM explicitly "sees" the ID in the context window
-        # so it knows what argument to pass to 'user_inventory_retriever(user_id=...)'
+        # Inject user_id into context
         context_aware_message = f"User ID: {chat_req.user_id}\n\n{chat_req.message}"
         user_message = HumanMessage(content=context_aware_message)
         
@@ -146,15 +158,13 @@ def chat_endpoint(request: Request, chat_req: ChatRequest):
         )
     except Exception as e:
         print(f"🔥 Chat Error: {e}")
-        # Be careful not to expose internal stack traces to users
         raise HTTPException(status_code=500, detail="Internal processing error")
 
 @app.get("/history/{thread_id}")
-@limiter.limit("20/minute") # Less strict for history, but still protected
+@limiter.limit("20/minute")
 def get_history(thread_id: str, request: Request):
     global agent_app
     try:
-        # Validate thread_id length manually here since it's a path param
         if len(thread_id) > 100:
              raise HTTPException(status_code=422, detail="Thread ID too long")
 
@@ -175,12 +185,9 @@ def get_history(thread_id: str, request: Request):
             else:
                 continue 
             
-            # Clean up the message content for history display if needed
-            # (Optional: strip the "User ID: ..." prefix if you don't want to show it in UI)
             content = msg.content
+            # Optional: Hide system injections from history
             if msg_type == "user" and content.startswith("User ID:"):
-                # Simple split to hide the system injection from the frontend history if desired
-                # But kept as-is for now for transparency/debugging
                 pass
 
             formatted_messages.append({
@@ -197,5 +204,8 @@ def get_history(thread_id: str, request: Request):
         return {"messages": []}
 
 if __name__ == "__main__":
-    print("🚀 Starting Secure Server on port 8001...")
-    uvicorn.run(app, host="0.0.0.0", port=8001)
+    # RAILWAY REQUIREMENT:
+    # Railway provides the PORT variable. If it's not found, default to 8001.
+    port = int(os.getenv("PORT", 8001))
+    print(f"🚀 Starting Secure Server on port {port}...")
+    uvicorn.run(app, host="0.0.0.0", port=port)
